@@ -23,6 +23,7 @@ ALL_INTERNAL_PROVIDERS: _NormalizedProviders = {
     "gemini": {},
     "mistral": {},
     "perplexity": {},
+    "openrouter": {},
 }
 
 

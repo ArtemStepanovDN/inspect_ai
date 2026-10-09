@@ -12,7 +12,7 @@ tbl-colwidths: [40,60]
 
 The `web_search()` tool provides models the ability to enhance their context window by performing a search. Web searches are executed using a provider. Providers are split into two categories:
 
--   Internal providers: `"openai"`, `"anthropic"`, `"gemini"`, `"grok"`, `"mistral"`, and `"perplexity"` - these use the model's built-in search capability and do not require separate API keys. These work only for their respective model provider (e.g. the "openai" search provider works only for `openai/*` models).
+-   Internal providers: `"openai"`, `"anthropic"`, `"gemini"`, `"grok"`, `"mistral"`, `"perplexity"`, and `"openrouter"` - these use the model's built-in search capability and do not require separate API keys. These work only for their respective model provider (e.g. the "openai" search provider works only for `openai/*` models).
 
 -   External providers: `"tavily"`, `"exa"`, and `"google"`. These are external services that work with any model and require separate accounts and API keys. Note that "google" is different from "gemini" - "google" refers to Google's Programmable Search Engine service, while "gemini" refers to Google's built-in search capability for Gemini models.
 
@@ -101,6 +101,14 @@ The `web_search()` tool can use Perplexity's built-in search capability when run
 For more details, see [Perplexity API Documentation](https://docs.perplexity.ai/api-reference/chat-completions-post).
 
 Note that when using the "perplexity" provider, you should also specify a fallback external provider (like "tavily", "exa", or "google") if you are also running the evaluation with non-Perplexity models.
+
+### OpenRouter Options
+
+The `web_search()` tool can use OpenRouter's web search server tool when running on `openrouter/*` models. OpenRouter uses the model's native search where it supports one and otherwise falls back to Exa. This provider does not require any API keys beyond what's needed for the model itself. Search parameters (e.g. `engine`, `max_results`, `allowed_domains`, `user_location`) can be passed using the `openrouter` provider options and will be forwarded to the server tool.
+
+For more details, see [OpenRouter Web Search](https://openrouter.ai/docs/guides/features/server-tools/web-search).
+
+Note that OpenRouter does not report the queries it ran, so the web search recorded in the transcript lists only the pages that were cited. OpenRouter web search can't be forced with `tool_choice`, and isn't used when the model is run with `responses_api=True`.
 
 ### Tavily Options
 

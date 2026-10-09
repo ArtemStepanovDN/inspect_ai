@@ -152,6 +152,7 @@ BOTH_BRIDGES = pytest.mark.parametrize(
                 gemini=False,
                 mistral=False,
                 perplexity=False,
+                openrouter=False,
             ),
             False,
         ),

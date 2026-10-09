@@ -1,9 +1,10 @@
 """Tests for the OpenRouter provider's Anthropic prompt-caching support."""
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
+from test_helpers.utils import skip_if_no_openrouter
 
 from inspect_ai.model._generate_config import GenerateConfig
 from inspect_ai.model._model_call import ModelCall
@@ -13,6 +14,11 @@ from inspect_ai.model._providers.openrouter import (
     _add_anthropic_cache_markers,
     _apply_cache_creation_usage,
 )
+
+if TYPE_CHECKING:
+    from openai.types.chat import ChatCompletion
+
+    from inspect_ai.tool._tool_info import ToolInfo
 
 EPHEMERAL: dict[str, str] = {"type": "ephemeral"}
 
@@ -772,3 +778,245 @@ async def test_openrouter_responses_api_does_not_send_explicit_cache_fields(
         if isinstance(content, list):
             for block in content:
                 assert "prompt_cache_breakpoint" not in block
+
+
+def _web_search_tool(options: dict[str, Any] | None = None) -> "ToolInfo":
+    from inspect_ai.tool._tool_info import ToolInfo
+
+    return ToolInfo(
+        name="web_search",
+        description="Search the web",
+        options={"openai": {}, "openrouter": options or {}},
+    )
+
+
+def _searched_completion(
+    annotations: list[dict[str, Any]], web_search_requests: int
+) -> "ChatCompletion":
+    from openai.types.chat import ChatCompletion
+
+    return ChatCompletion.model_validate(
+        {
+            "id": "gen-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "openai/gpt-5-mini",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "Max Verstappen won. (formula1.com)",
+                        "annotations": annotations,
+                    },
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "server_tool_use_details": {"web_search_requests": web_search_requests},
+            },
+        }
+    )
+
+
+def test_web_search_sent_as_server_tool() -> None:
+    from inspect_ai.tool._tool_info import ToolInfo
+
+    api = _make_api("openai/gpt-5-mini")
+    other = ToolInfo(name="add", description="Add two numbers")
+    tools = api.tools_to_openai([other, _web_search_tool({"max_results": 3})])
+
+    assert tools[0] == {
+        "type": "openrouter:web_search",
+        "parameters": {"max_results": 3},
+    }
+    assert tools[1]["type"] == "function"
+    assert tools[1]["function"]["name"] == "add"
+
+
+def test_web_search_keeps_anthropic_cache_marker_on_function_tool() -> None:
+    from inspect_ai.tool._tool_info import ToolInfo
+
+    api = _make_api("anthropic/claude-haiku-4.5")
+    other = ToolInfo(name="add", description="Add two numbers")
+    request: dict[str, Any] = {
+        "messages": [],
+        "tools": api.tools_to_openai([other, _web_search_tool()]),
+    }
+    _add_anthropic_cache_markers(request)
+    assert "cache_control" not in request["tools"][0]
+    assert _has_cache_control(request["tools"][1])
+
+
+def test_web_search_server_tool_without_options() -> None:
+    api = _make_api("openai/gpt-5-mini")
+    tools: list[Any] = api.tools_to_openai([_web_search_tool()])
+    assert tools == [{"type": "openrouter:web_search"}]
+
+
+def test_web_search_without_openrouter_provider_stays_a_function() -> None:
+    from inspect_ai.tool._tool_info import ToolInfo
+
+    api = _make_api("openai/gpt-5-mini")
+    tavily_only = ToolInfo(
+        name="web_search", description="Search the web", options={"tavily": {}}
+    )
+    tools = api.tools_to_openai([tavily_only])
+    assert tools[0]["type"] == "function"
+
+
+def test_web_search_rejects_non_dict_options() -> None:
+    from inspect_ai.tool._tool_info import ToolInfo
+
+    api = _make_api("openai/gpt-5-mini")
+    tool = ToolInfo(
+        name="web_search", description="Search", options={"openrouter": "yes"}
+    )
+    with pytest.raises(TypeError):
+        api.tools_to_openai([tool])
+
+
+def test_web_search_forced_tool_choice_raises() -> None:
+    from inspect_ai.tool import ToolFunction
+
+    api = _make_api("openai/gpt-5-mini")
+    with pytest.raises(ValueError, match="cannot be forced"):
+        api.resolve_tools(
+            [_web_search_tool()], ToolFunction(name="web_search"), GenerateConfig()
+        )
+
+
+def test_web_search_citations_and_tool_use() -> None:
+    from inspect_ai._util.citation import UrlCitation
+    from inspect_ai._util.content import ContentText, ContentToolUse
+
+    api = _make_api("openai/gpt-5-mini")
+    completion = _searched_completion(
+        [
+            {
+                "type": "url_citation",
+                "url_citation": {
+                    "url": "https://www.formula1.com/en/results/2026/races",
+                    "title": "2026 RACE RESULTS",
+                    "start_index": 19,
+                    "end_index": 34,
+                },
+            },
+            {
+                "type": "url_citation",
+                "url_citation": {
+                    "url": "https://www.espn.com/f1/",
+                    "title": "",
+                    "start_index": 0,
+                    "end_index": 0,
+                },
+            },
+        ],
+        web_search_requests=2,
+    )
+    [choice] = api.chat_choices_from_completion(completion, [_web_search_tool()])
+
+    content = choice.message.content
+    assert isinstance(content, list)
+    tool_use, text = content
+    assert isinstance(tool_use, ContentToolUse)
+    assert tool_use.tool_type == "web_search"
+    assert tool_use.id == "gen-1-web_search-0"
+    assert tool_use.result == (
+        "2026 RACE RESULTS — https://www.formula1.com/en/results/2026/races\n"
+        "https://www.espn.com/f1/"
+    )
+    assert isinstance(text, ContentText)
+    assert text.text == "Max Verstappen won. (formula1.com)"
+    assert text.citations == [
+        UrlCitation(
+            url="https://www.formula1.com/en/results/2026/races",
+            title="2026 RACE RESULTS",
+            cited_text=(19, 34),
+        ),
+        UrlCitation(url="https://www.espn.com/f1/"),
+    ]
+
+
+def test_web_search_without_results_still_records_search() -> None:
+    from inspect_ai._util.content import ContentToolUse
+
+    api = _make_api("openai/gpt-5-mini")
+    completion = _searched_completion([], web_search_requests=1)
+    [choice] = api.chat_choices_from_completion(completion, [_web_search_tool()])
+
+    content = choice.message.content
+    assert isinstance(content, list)
+    assert isinstance(content[0], ContentToolUse)
+    assert content[0].result == ""
+
+
+def test_no_web_search_leaves_message_unchanged() -> None:
+    api = _make_api("openai/gpt-5-mini")
+    completion = _searched_completion([], web_search_requests=0)
+    [choice] = api.chat_choices_from_completion(completion, [_web_search_tool()])
+    assert choice.message.content == "Max Verstappen won. (formula1.com)"
+
+
+@pytest.mark.anyio
+async def test_web_search_tool_use_not_replayed() -> None:
+    from inspect_ai._util.content import ContentText, ContentToolUse
+    from inspect_ai.model._chat_message import ChatMessageAssistant
+
+    api = _make_api("openai/gpt-5-mini")
+    [message] = await api.messages_to_openai(
+        [
+            ChatMessageAssistant(
+                content=[
+                    ContentToolUse(
+                        tool_type="web_search",
+                        id="",
+                        name="web_search",
+                        arguments="{}",
+                        result="https://www.espn.com/f1/",
+                    ),
+                    ContentText(text="Max Verstappen won."),
+                ]
+            )
+        ]
+    )
+    assert str(message["content"]).strip() == "Max Verstappen won."
+
+
+@pytest.mark.anyio
+@skip_if_no_openrouter
+@pytest.mark.parametrize(
+    "model_name", ["openai/gpt-5-mini", "anthropic/claude-haiku-4.5"]
+)
+async def test_web_search_live(model_name: str) -> None:
+    from inspect_ai._util.content import ContentText, ContentToolUse
+    from inspect_ai.model import ChatMessage, ChatMessageUser, get_model
+    from inspect_ai.tool import web_search
+
+    model = get_model(f"openrouter/{model_name}")
+    tools = [web_search("openrouter")]
+    messages: list[ChatMessage] = [
+        ChatMessageUser(
+            content="Search the web: who won the most recent Formula 1 Grand "
+            "Prix? Answer in one sentence."
+        )
+    ]
+    output = await model.generate(input=messages, tools=tools)
+
+    content = output.message.content
+    assert isinstance(content, list)
+    assert any(
+        isinstance(c, ContentToolUse) and c.tool_type == "web_search" for c in content
+    )
+    assert any(isinstance(c, ContentText) and c.citations for c in content)
+
+    # a follow-up turn replays the searched turn
+    messages = messages + [
+        output.message,
+        ChatMessageUser(content="Which team does that driver race for?"),
+    ]
+    output = await model.generate(input=messages, tools=tools)
+    assert output.message.text

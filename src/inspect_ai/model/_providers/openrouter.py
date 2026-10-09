@@ -5,11 +5,14 @@ from typing import Any, cast
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionMessageParam,
+    ChatCompletionToolParam,
 )
+from openai.types.chat.chat_completion import Choice
 from pydantic import JsonValue
 from typing_extensions import NotRequired, TypedDict, override
 
-from inspect_ai._util.content import ContentReasoning
+from inspect_ai._util.citation import UrlCitation
+from inspect_ai._util.content import ContentReasoning, ContentText, ContentToolUse
 from inspect_ai._util.error import PrerequisiteError
 from inspect_ai._util.logger import warn_once
 from inspect_ai.model import _openrouter_reasoning
@@ -27,7 +30,7 @@ from inspect_ai.model._openai import (
     chat_choices_from_openai,
     openai_chat_message,
 )
-from inspect_ai.tool import ToolChoice
+from inspect_ai.tool import ToolChoice, ToolFunction
 from inspect_ai.tool._tool_info import ToolInfo
 
 from .._generate_config import GenerateConfig
@@ -215,7 +218,42 @@ class OpenRouterAPI(OpenAICompatibleAPI):
             else:
                 return None
 
-        return chat_choices_from_openai(completion, tools, extract_reasoning_details)
+        choices = chat_choices_from_openai(completion, tools, extract_reasoning_details)
+        if any(_web_search_options(tool) is not None for tool in tools):
+            raw_choices = sorted(completion.choices, key=lambda c: c.index)
+            for choice, raw in zip(choices, raw_choices):
+                _add_web_search_content(choice, raw, completion)
+        return choices
+
+    @override
+    def resolve_tools(
+        self, tools: list[ToolInfo], tool_choice: ToolChoice, config: GenerateConfig
+    ) -> tuple[list[ToolInfo], ToolChoice, GenerateConfig]:
+        if (
+            not self.responses_api
+            and isinstance(tool_choice, ToolFunction)
+            and tool_choice.name == "web_search"
+            and any(_web_search_options(tool) is not None for tool in tools)
+        ):
+            raise ValueError(
+                "OpenRouter's web search server tool cannot be forced with "
+                "tool_choice: the model decides when to search."
+            )
+        return super().resolve_tools(tools, tool_choice, config)
+
+    @override
+    def tools_to_openai(self, tools: list[ToolInfo]) -> list[ChatCompletionToolParam]:
+        # web_search() runs as OpenRouter's server tool, which is declared by
+        # type rather than as a function for the model to call.
+        function_tools = [tool for tool in tools if _web_search_options(tool) is None]
+        server_tools = [
+            _web_search_server_tool(options)
+            for tool in tools
+            if (options := _web_search_options(tool)) is not None
+        ]
+        # server tools go first so Anthropic's cache marker stays on the last
+        # function tool (see _add_anthropic_cache_markers)
+        return server_tools + super().tools_to_openai(function_tools)
 
     @override
     async def messages_to_openai(
@@ -420,6 +458,103 @@ class OpenRouterAPI(OpenAICompatibleAPI):
                 params[EXTRA_BODY]["reasoning"] = reasoning
 
         return params
+
+
+def _web_search_options(tool: ToolInfo) -> dict[str, Any] | None:
+    """OpenRouter options of a `web_search()` tool, or None if it doesn't enable OpenRouter."""
+    if (
+        tool.name != "web_search"
+        or not tool.options
+        or "openrouter" not in tool.options
+    ):
+        return None
+    options = tool.options["openrouter"]
+    if options is None:
+        return {}
+    if not isinstance(options, dict):
+        raise TypeError(
+            f"Expected a dictionary for openrouter options, got {type(options)}"
+        )
+    return options
+
+
+def _web_search_server_tool(options: dict[str, Any]) -> ChatCompletionToolParam:
+    """OpenRouter `openrouter:web_search` server tool definition.
+
+    https://openrouter.ai/docs/guides/features/server-tools/web-search
+    """
+    tool: dict[str, Any] = {"type": "openrouter:web_search"}
+    if options:
+        tool["parameters"] = options
+    return cast(ChatCompletionToolParam, tool)
+
+
+def _add_web_search_content(
+    choice: ChatCompletionChoice,
+    raw: Choice,
+    completion: ChatCompletion,
+) -> None:
+    """Record OpenRouter's server-side web search in the assistant message.
+
+    OpenRouter returns the pages a search used as `url_citation` annotations
+    and the number of searches in `usage.server_tool_use_details`, but not the
+    queries. Citations go on the first `ContentText` (as for other providers),
+    and a `ContentToolUse` block, listing the cited pages as its result, marks
+    that a search ran.
+    """
+    citations = [
+        UrlCitation(
+            url=annotation.url_citation.url,
+            title=annotation.url_citation.title or None,
+            cited_text=(
+                (annotation.url_citation.start_index, annotation.url_citation.end_index)
+                if annotation.url_citation.end_index
+                > annotation.url_citation.start_index
+                else None
+            ),
+        )
+        for annotation in (raw.message.annotations or [])
+        if annotation.type == "url_citation" and annotation.url_citation.url
+    ]
+    # search count is per completion, so only attributable with a single choice
+    searched = len(completion.choices) == 1 and _web_search_requests(completion) > 0
+    if not citations and not searched:
+        return
+
+    msg = choice.message
+    if isinstance(msg.content, str):
+        msg.content = [ContentText(text=msg.content)]
+    if citations:
+        text = next((c for c in msg.content if isinstance(c, ContentText)), None)
+        if text is None:
+            text = ContentText(text="")
+            msg.content.append(text)
+        text.citations = citations
+
+    # insert ahead of the answer text, after any reasoning
+    index = next(
+        (i for i, c in enumerate(msg.content) if not isinstance(c, ContentReasoning)),
+        len(msg.content),
+    )
+    msg.content.insert(
+        index,
+        ContentToolUse(
+            tool_type="web_search",
+            id=f"{completion.id}-web_search-{raw.index}",
+            name="web_search",
+            arguments="{}",
+            result="\n".join(
+                f"{c.title} — {c.url}" if c.title else c.url for c in citations
+            ),
+        ),
+    )
+
+
+def _web_search_requests(completion: ChatCompletion) -> int:
+    usage = completion.usage.model_extra if completion.usage else None
+    details = (usage or {}).get("server_tool_use_details")
+    count = details.get("web_search_requests") if isinstance(details, dict) else None
+    return count if isinstance(count, int) else 0
 
 
 def _requires_reasoning_content(model_name: str) -> bool:
