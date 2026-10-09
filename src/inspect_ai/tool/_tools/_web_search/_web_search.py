@@ -49,7 +49,7 @@ class WebSearchProviders(TypedDict, total=False):
 
     -   External providers: `"tavily"`, `"exa"`, and `"google"`. These are external services that work with any model and require separate accounts and API keys. Note that "google" is different from "gemini" - "google" refers to Google's Programmable Search Engine service, while "gemini" refers to Google's built-in search capability for Gemini models.
 
-    By default, all internal providers are enabled if there are no external providers defined.
+    By default, all internal providers except "openrouter" are enabled if there are no external providers defined.
     If an external provider is defined then you need to explicitly enable internal providers
     that you want to use.
 
@@ -75,7 +75,7 @@ class WebSearchProviders(TypedDict, total=False):
     """Use Perplexity internal provider. For available options see <https://docs.perplexity.ai/api-reference/chat-completions-post>"""
 
     openrouter: dict[str, Any] | bool
-    """Use OpenRouter internal provider. For available options see <https://openrouter.ai/docs/guides/features/server-tools/web-search>."""
+    """Use OpenRouter internal provider. Not enabled by default; name it explicitly to use it. For available options see <https://openrouter.ai/docs/guides/features/server-tools/web-search>."""
 
     tavily: dict[str, Any] | bool
     """Use Tavili external provider. For available options see <Use Exa external provider. For available options see <https://inspect.aisi.org.uk/tools-standard.html#tavili-options>."""
@@ -130,7 +130,7 @@ def web_search(
     - External providers: "tavily", "google", and "exa". These are external services
       that work with any model and require separate accounts and API keys.
 
-    By default, all internal providers are enabled if there are no external providers defined.
+    By default, all internal providers except "openrouter" are enabled if there are no external providers defined.
     If an external provider is defined then you need to explicitly enable internal providers
     that you want to use.
 
@@ -310,7 +310,6 @@ def _normalize_config(
             "gemini": {},
             "mistral": {},
             "perplexity": {},
-            "openrouter": {},
         }
     for entry in providers:
         if isinstance(entry, str):

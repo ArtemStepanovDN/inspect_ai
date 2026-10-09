@@ -827,11 +827,13 @@ def test_web_search_sent_as_server_tool() -> None:
 
     api = _make_api("openai/gpt-5-mini")
     other = ToolInfo(name="add", description="Add two numbers")
-    tools = api.tools_to_openai([other, _web_search_tool({"max_results": 3})])
+    tools = api.tools_to_openai(
+        [other, _web_search_tool({"engine": "native", "max_results": 3})]
+    )
 
     assert tools[0] == {
         "type": "openrouter:web_search",
-        "parameters": {"max_results": 3},
+        "parameters": {"engine": "native", "max_results": 3},
     }
     assert tools[1]["type"] == "function"
     assert tools[1]["function"]["name"] == "add"
